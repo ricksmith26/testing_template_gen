@@ -1,4 +1,8 @@
-# versions.tf
+############################################################
+# main.tf — Create an empty repo + a workflow that clones
+# a template repo and force-pushes it into the new repo.
+############################################################
+
 terraform {
   required_version = ">= 1.6.0"
   required_providers {
@@ -9,13 +13,9 @@ terraform {
   }
 }
 
-# provider.tf
-provider "github" {
-  # Set GITHUB_TOKEN in your environment with repo/admin:org scopes as needed
-  owner = var.github_owner  # org or username
-}
-
-# variables.tf
+#############################################
+# Variables
+#############################################
 variable "github_owner" {
   type        = string
   description = "GitHub org or user that will own the new repo"
@@ -26,57 +26,115 @@ variable "new_repo_name" {
   description = "Name of the new repo to create"
 }
 
-variable "template_owner" {
+variable "repo_pat" {
   type        = string
-  description = "Owner of the template repo"
+  sensitive   = true
+  description = "GitHub PAT with 'repo' scope (and org write if needed) used by the workflow to push"
 }
 
-variable "template_repo" {
-  type        = string
-  description = "Name of the template repo"
+#############################################
+# Provider
+#############################################
+provider "github" {
+  owner = var.github_owner
+  # Export GITHUB_TOKEN with sufficient scopes for Terraform to create repos/secrets
+  #   export GITHUB_TOKEN=ghp_xxx
 }
 
-# main.tf
-resource "github_repository" "from_template" {
-  name        = var.new_repo_name
-  description = "Created from template ${var.template_owner}/${var.template_repo} via Terraform"
-  visibility  = "private" # or "public" / "internal" (orgs only)
-  has_issues  = true
-  has_wiki    = false
-  auto_init   = false      # not needed when using template
+#############################################
+# Resources
+#############################################
 
-  template {
-    owner      = var.template_owner
-    repository = var.template_repo
-  }
+# 1) Create an empty repo we’ll populate via a workflow.
+resource "github_repository" "bootstrap" {
+  name                   = var.new_repo_name
+  description            = "Bootstrapped by Terraform; content populated by a workflow"
+  visibility             = "private" # or "public"/"internal"
+  auto_init              = true      # ensures 'main' exists
+  delete_branch_on_merge = true
 
-  # Optional: set default branch if your template isn't "main"
+  # Optional: tweak default branch name if your org uses something else
   # default_branch = "main"
 }
 
-# Optional: add a workflow to the freshly created repo
-resource "github_repository_file" "example_workflow" {
-  repository          = github_repository.from_template.name
-  file                = ".github/workflows/ci.yml"
-  commit_message      = "Add CI workflow"
+# 2) Store a PAT for the workflow to authenticate pushes.
+resource "github_actions_secret" "repo_token" {
+  repository      = github_repository.bootstrap.name
+  secret_name     = "REPO_TOKEN"
+  plaintext_value = var.repo_pat
+}
+
+# 3) Add a workflow that clones a template and force-pushes into this repo.
+resource "github_repository_file" "bootstrap_workflow" {
+  repository          = github_repository.bootstrap.name
+  file                = ".github/workflows/bootstrap.yml"
   branch              = "main"
+  commit_message      = "Add bootstrap workflow"
   overwrite_on_create = true
-  content             = <<-YAML
-    name: CI
-    on:
-      push:
-        branches: [main]
-      pull_request:
-        branches: [main]
-    jobs:
-      build:
-        runs-on: ubuntu-latest
-        steps:
-          - uses: actions/checkout@v4
-          - uses: actions/setup-node@v4
-            with:
-              node-version: '20'
-          - run: npm ci
-          - run: npm test --if-present
-    YAML
+
+  # NOTE: Using plain <<EOT ... EOT with no leading/trailing spaces on the markers.
+  content = <<EOT
+name: Bootstrap from Template
+on:
+  workflow_dispatch:
+    inputs:
+      template:
+        description: "owner/repo of template (e.g. my-org/react-template)"
+        required: true
+      ref:
+        description: "Template ref (branch/tag/SHA)"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure Git
+        run: |
+          git config --global user.email "bot@example.com"
+          git config --global user.name "Repo Bootstrap Bot"
+
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone template
+        shell: bash
+        run: |
+          rm -rf ./*
+          git clone --depth 1 --branch "${{ github.event.inputs.ref }}" "https://github.com/${{ github.event.inputs.template }}.git" __tmpl__
+          shopt -s dotglob
+          mv __tmpl__/* .
+          rm -rf __tmpl__
+
+      - name: Push to target (force)
+        env:
+          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
+        shell: bash
+        run: |
+          rm -rf .git
+          git init
+          git add .
+          git commit -m "Scaffold from ${{ github.event.inputs.template }}@${{ github.event.inputs.ref }}"
+          git branch -M main
+          git remote add origin "https://x-access-token:${REPO_TOKEN}@github.com/${{ github.repository }}.git"
+          git push -u origin main --force
+EOT
+}
+
+#############################################
+# Helpful outputs
+#############################################
+output "repo_html_url" {
+  value       = github_repository.bootstrap.html_url
+  description = "URL of the created repository"
+}
+
+output "workflow_dispatch_hint" {
+  value = "After apply, go to Actions → 'Bootstrap from Template' → Run workflow, and pass inputs: template='owner/repo', ref='main'"
 }
