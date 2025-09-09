@@ -1,0 +1,82 @@
+# versions.tf
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    github = {
+      source  = "integrations/github"
+      version = "~> 6.3"
+    }
+  }
+}
+
+# provider.tf
+provider "github" {
+  # Set GITHUB_TOKEN in your environment with repo/admin:org scopes as needed
+  owner = var.github_owner  # org or username
+}
+
+# variables.tf
+variable "github_owner" {
+  type        = string
+  description = "GitHub org or user that will own the new repo"
+}
+
+variable "new_repo_name" {
+  type        = string
+  description = "Name of the new repo to create"
+}
+
+variable "template_owner" {
+  type        = string
+  description = "Owner of the template repo"
+}
+
+variable "template_repo" {
+  type        = string
+  description = "Name of the template repo"
+}
+
+# main.tf
+resource "github_repository" "from_template" {
+  name        = var.new_repo_name
+  description = "Created from template ${var.template_owner}/${var.template_repo} via Terraform"
+  visibility  = "private" # or "public" / "internal" (orgs only)
+  has_issues  = true
+  has_wiki    = false
+  auto_init   = false      # not needed when using template
+
+  template {
+    owner      = var.template_owner
+    repository = var.template_repo
+  }
+
+  # Optional: set default branch if your template isn't "main"
+  # default_branch = "main"
+}
+
+# Optional: add a workflow to the freshly created repo
+resource "github_repository_file" "example_workflow" {
+  repository          = github_repository.from_template.name
+  file                = ".github/workflows/ci.yml"
+  commit_message      = "Add CI workflow"
+  branch              = "main"
+  overwrite_on_create = true
+  content             = <<-YAML
+    name: CI
+    on:
+      push:
+        branches: [main]
+      pull_request:
+        branches: [main]
+    jobs:
+      build:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - uses: actions/setup-node@v4
+            with:
+              node-version: '20'
+          - run: npm ci
+          - run: npm test --if-present
+    YAML
+}
